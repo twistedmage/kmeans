@@ -44,6 +44,7 @@
 #include <stdlib.h>
 
 #include "kmeans.h"
+#include "cuda.h"
 
 static inline int nextPowerOfTwo(int n) {
     n--;
@@ -188,7 +189,7 @@ void compute_delta(int *deviceIntermediates,
     }
 
     if (threadIdx.x == 0) {
-        deviceIntermediates[idx] = intermediates[threadIdx.x];
+        atomicAdd(deviceIntermediates, intermediates[threadIdx.x]);
     }
 }
 
@@ -260,7 +261,7 @@ float** cuda_kmeans(float **objects,      /* in: [numObjs][numCoords] */
     //  two, and it *must* be no larger than the number of bits that will
     //  fit into an unsigned char, the type used to keep track of membership
     //  changes in the kernel.
-    const unsigned int numThreadsPerClusterBlock = 128;
+    const unsigned int numThreadsPerClusterBlock = 1024;
     const unsigned int numClusterBlocks =
         (numObjs + numThreadsPerClusterBlock - 1) / numThreadsPerClusterBlock;
 #if BLOCK_SHARED_MEM_OPTIMIZATION
@@ -299,8 +300,6 @@ float** cuda_kmeans(float **objects,      /* in: [numObjs][numCoords] */
               numObjs*numCoords*sizeof(float), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(deviceMembership, membership,
               numObjs*sizeof(int), cudaMemcpyHostToDevice));
-    int idx=0;
-    unsigned int d[numReductionBlocks*numReductionThreads];
     	
     do {
         checkCuda(cudaMemcpy(deviceClusters, dimClusters[0],
@@ -316,16 +315,10 @@ float** cuda_kmeans(float **objects,      /* in: [numObjs][numCoords] */
             (deviceIntermediates, numClusterBlocks, numReductionThreads);
         cudaDeviceSynchronize(); checkLastCudaError();
 
-        checkCuda(cudaMemcpy(d, deviceIntermediates,
-                  numReductionBlocks*numReductionThreads*sizeof(unsigned int), cudaMemcpyDeviceToHost));
-        //sum every 1024
-        idx=0;
-        delta=0;
-        while(idx<numReductionBlocks*numReductionThreads)
-        {
-		delta+=d[idx];
-		idx+=1024;
-	}
+	int d;
+        checkCuda(cudaMemcpy(&d, deviceIntermediates,
+                  sizeof(int), cudaMemcpyDeviceToHost));
+        delta=d;
 
         checkCuda(cudaMemcpy(membership, deviceMembership,
                   numObjs*sizeof(int), cudaMemcpyDeviceToHost));
