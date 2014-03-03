@@ -173,21 +173,22 @@ void compute_delta(int *deviceIntermediates,
     extern __shared__ unsigned int intermediates[];
 
     //  Copy global intermediate values into shared memory.
+    int idx=blockDim.x * blockIdx.x + threadIdx.x;
     intermediates[threadIdx.x] =
-        (threadIdx.x < numIntermediates) ? deviceIntermediates[threadIdx.x] : 0;
+        (idx < numIntermediates) ? deviceIntermediates[idx] : 0;
 
     __syncthreads();
 
     //  numIntermediates2 *must* be a power of two!
     for (unsigned int s = numIntermediates2 / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
+        if (idx < s) {
             intermediates[threadIdx.x] += intermediates[threadIdx.x + s];
         }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        deviceIntermediates[0] = intermediates[0];
+        deviceIntermediates[idx] = intermediates[threadIdx.x];
     }
 }
 
@@ -254,7 +255,7 @@ float** cuda_kmeans(float **objects,      /* in: [numObjs][numCoords] */
 
     malloc2D(newClusters, numCoords, numClusters, float);
     memset(newClusters[0], 0, numCoords * numClusters * sizeof(float));
-
+    
     //  To support reduction, numThreadsPerClusterBlock *must* be a power of
     //  two, and it *must* be no larger than the number of bits that will
     //  fit into an unsigned char, the type used to keep track of membership
@@ -283,20 +284,24 @@ float** cuda_kmeans(float **objects,      /* in: [numObjs][numCoords] */
 #endif
 
     const unsigned int numReductionThreads =
-        nextPowerOfTwo(numClusterBlocks);
+        min(1024,nextPowerOfTwo(numClusterBlocks));
+    const unsigned int numReductionBlocks =
+        nextPowerOfTwo(numClusterBlocks)/1024 + 1;
     const unsigned int reductionBlockSharedDataSize =
         numReductionThreads * sizeof(unsigned int);
 
     checkCuda(cudaMalloc(&deviceObjects, numObjs*numCoords*sizeof(float)));
     checkCuda(cudaMalloc(&deviceClusters, numClusters*numCoords*sizeof(float)));
     checkCuda(cudaMalloc(&deviceMembership, numObjs*sizeof(int)));
-    checkCuda(cudaMalloc(&deviceIntermediates, numReductionThreads*sizeof(unsigned int)));
+    checkCuda(cudaMalloc(&deviceIntermediates, numReductionBlocks*numReductionThreads*sizeof(unsigned int)));
 
     checkCuda(cudaMemcpy(deviceObjects, dimObjects[0],
               numObjs*numCoords*sizeof(float), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(deviceMembership, membership,
               numObjs*sizeof(int), cudaMemcpyHostToDevice));
-
+    int idx=0;
+    unsigned int d[numReductionBlocks*numReductionThreads];
+    	
     do {
         checkCuda(cudaMemcpy(deviceClusters, dimClusters[0],
                   numClusters*numCoords*sizeof(float), cudaMemcpyHostToDevice));
@@ -307,16 +312,20 @@ float** cuda_kmeans(float **objects,      /* in: [numObjs][numCoords] */
              deviceObjects, deviceClusters, deviceMembership, deviceIntermediates);
 
         cudaDeviceSynchronize(); checkLastCudaError();
-
-        compute_delta <<< 1, numReductionThreads, reductionBlockSharedDataSize >>>
+        compute_delta <<< numReductionBlocks, numReductionThreads, reductionBlockSharedDataSize >>>
             (deviceIntermediates, numClusterBlocks, numReductionThreads);
-
         cudaDeviceSynchronize(); checkLastCudaError();
 
-        int d;
-        checkCuda(cudaMemcpy(&d, deviceIntermediates,
-                  sizeof(int), cudaMemcpyDeviceToHost));
-        delta = (float)d;
+        checkCuda(cudaMemcpy(d, deviceIntermediates,
+                  numReductionBlocks*numReductionThreads*sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        //sum every 1024
+        idx=0;
+        delta=0;
+        while(idx<numReductionBlocks*numReductionThreads)
+        {
+		delta+=d[idx];
+		idx+=1024;
+	}
 
         checkCuda(cudaMemcpy(membership, deviceMembership,
                   numObjs*sizeof(int), cudaMemcpyDeviceToHost));
